@@ -2,7 +2,9 @@ use std::fmt::{self, Display};
 use std::io::{Cursor, Write as _};
 use std::marker::PhantomData;
 use std::ops::{AddAssign, Deref, DerefMut, SubAssign};
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use clarity_types::types::MAX_VALUE_SIZE;
 use stacks_common::bounded_format;
@@ -504,6 +506,33 @@ fn placeholder_for_type(ty: ValType) -> Val {
     Val::default_for_ty(ty)
 }
 
+/// Modules are only usable with the engine that compiled them, so all
+/// contexts share one engine and parsed modules are cached by content hash.
+pub fn shared_engine() -> Engine {
+    static ENGINE: OnceLock<Engine> = OnceLock::new();
+    ENGINE.get_or_init(Engine::default).clone()
+}
+
+fn load_module(engine: &Engine, wasm_module: &[u8]) -> Result<Module, VmExecutionError> {
+    static MODULES: OnceLock<Mutex<HashMap<u64, Module>>> = OnceLock::new();
+    let key = {
+        let mut hasher = DefaultHasher::new();
+        wasm_module.hash(&mut hasher);
+        hasher.finish()
+    };
+    let mut modules = MODULES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(module) = modules.get(&key) {
+        return Ok(module.clone());
+    }
+    let module = Module::new(engine, wasm_module)
+        .map_err(|e| VmExecutionError::Wasm(WasmError::UnableToLoadModule(e)))?;
+    modules.insert(key, module.clone());
+    Ok(module)
+}
+
 /// Initialize a contract, executing all of the top-level expressions and
 /// registering all of the definitions in the context. Returns the value
 /// returned from the last top-level expression.
@@ -530,10 +559,7 @@ pub fn initialize_contract(
     );
     let module = init_context
         .contract_context()
-        .with_wasm_module(|wasm_module| {
-            Module::new(&engine, wasm_module)
-                .map_err(|e| VmExecutionError::Wasm(WasmError::UnableToLoadModule(e)))
-        })?;
+        .with_wasm_module(|wasm_module| load_module(&engine, wasm_module))?;
     let mut store = ClarityWasmStore::new(&engine, init_context);
     let mut linker = Linker::new(&engine);
 
@@ -627,10 +653,9 @@ pub fn call_function<'a>(
         .ok_or(RuntimeCheckErrorKind::UndefinedFunction(
             function_name.to_string(),
         ))?;
-    let module = context.contract_context().with_wasm_module(|wasm_module| {
-        Module::new(&engine, wasm_module)
-            .map_err(|e| VmExecutionError::Wasm(WasmError::UnableToLoadModule(e)))
-    })?;
+    let module = context
+        .contract_context()
+        .with_wasm_module(|wasm_module| load_module(&engine, wasm_module))?;
     let mut store = ClarityWasmStore::new(&engine, context);
     let mut linker = Linker::new(&engine);
 

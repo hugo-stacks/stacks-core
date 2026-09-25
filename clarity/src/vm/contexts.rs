@@ -1510,7 +1510,7 @@ impl<'a, 'hooks> GlobalContext<'a, 'hooks> {
             eval_hooks: None,
             execution_resource_limiter: ResourceLimiter::unlimited(),
             #[cfg(feature = "clarity-wasm")]
-            engine: Engine::default(),
+            engine: crate::vm::clarity_wasm::shared_engine(),
             #[cfg(feature = "clarity-wasm")]
             cost_meter: CostMeter::MIN,
         }
