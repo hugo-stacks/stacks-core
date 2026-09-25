@@ -1,9 +1,10 @@
+use std::cell::OnceCell;
+use std::collections::HashMap;
 use std::fmt::{self, Display};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{Cursor, Write as _};
 use std::marker::PhantomData;
 use std::ops::{AddAssign, Deref, DerefMut, SubAssign};
-use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use clarity_types::types::MAX_VALUE_SIZE;
@@ -513,6 +514,26 @@ pub fn shared_engine() -> Engine {
     ENGINE.get_or_init(Engine::default).clone()
 }
 
+/// Host functions don't depend on the store, so they are linked once per thread
+/// and each call clones the linker before defining its own cost globals.
+fn host_linker(
+    engine: &Engine,
+) -> Result<Linker<ClarityWasmContext<'static, 'static, 'static>>, VmExecutionError> {
+    thread_local! {
+        static LINKER: OnceCell<Linker<ClarityWasmContext<'static, 'static, 'static>>> =
+            const { OnceCell::new() };
+    }
+    LINKER.with(|cell| {
+        if let Some(linker) = cell.get().filter(|l| Engine::same(l.engine(), engine)) {
+            return Ok(linker.clone());
+        }
+        let mut linker = Linker::new(engine);
+        link_host_functions(&mut linker)?;
+        let _ = cell.set(linker.clone());
+        Ok(linker)
+    })
+}
+
 fn load_module(engine: &Engine, wasm_module: &[u8]) -> Result<Module, VmExecutionError> {
     static MODULES: OnceLock<Mutex<HashMap<u64, Module>>> = OnceLock::new();
     let key = {
@@ -561,11 +582,8 @@ pub fn initialize_contract(
         .contract_context()
         .with_wasm_module(|wasm_module| load_module(&engine, wasm_module))?;
     let mut store = ClarityWasmStore::new(&engine, init_context);
-    let mut linker = Linker::new(&engine);
-
-    // Link in the host interface functions.
+    let mut linker = host_linker(&engine)?;
     link_cost_globals(&mut linker, &mut store)?;
-    link_host_functions(&mut linker)?;
 
     let instance = linker
         .instantiate_and_start(&mut store, &module)
@@ -657,10 +675,7 @@ pub fn call_function<'a>(
         .contract_context()
         .with_wasm_module(|wasm_module| load_module(&engine, wasm_module))?;
     let mut store = ClarityWasmStore::new(&engine, context);
-    let mut linker = Linker::new(&engine);
-
-    // Link in the host interface functions.
-    link_host_functions(&mut linker)?;
+    let mut linker = host_linker(&engine)?;
 
     let expected_args = func_types.get_arg_types();
     let mut cost_globals = link_cost_globals(&mut linker, &mut store.as_context_mut())?;

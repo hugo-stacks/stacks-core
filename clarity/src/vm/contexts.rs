@@ -256,7 +256,11 @@ pub struct ContractContext {
     /// The clarity version of this contract
     clarity_version: ClarityVersion,
     #[cfg(feature = "clarity-wasm")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "wasm_module_hex"
+    )]
     pub wasm_module: Option<Vec<u8>>,
     /// True while the contract is being deployed (inside `initialize_from_ast`).
     /// Constants may only be used as `contract-call?` dispatch targets
@@ -2059,6 +2063,27 @@ impl CallStack {
     #[cfg(not(feature = "developer-mode"))]
     pub fn make_stack_trace(&self) -> StackTrace {
         Vec::new()
+    }
+}
+
+/// The contract context is stored as JSON and loaded on every call, so the
+/// module is kept as a hex string rather than an array of numbers.
+#[cfg(feature = "clarity-wasm")]
+mod wasm_module_hex {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use stacks_common::util::hash::{hex_bytes, to_hex};
+
+    pub fn serialize<S: Serializer>(module: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match module {
+            Some(bytes) => s.serialize_some(&to_hex(bytes)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        Option::<String>::deserialize(d)?
+            .map(|hex| hex_bytes(&hex).map_err(serde::de::Error::custom))
+            .transpose()
     }
 }
 
