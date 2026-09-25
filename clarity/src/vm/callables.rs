@@ -105,6 +105,10 @@ pub struct DefinedFunction {
     pub define_type: DefineType,
     arguments: Vec<ClarityName>,
     body: SymbolicExpression,
+    /// Return type, only set by the Wasm runtime.
+    #[cfg(feature = "clarity-wasm")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    return_type: Option<TypeSignature>,
 }
 
 /// Native callable that also receives execution state and invocation context.
@@ -180,7 +184,15 @@ impl DefinedFunction {
             define_type,
             body,
             arg_types: types,
+            #[cfg(feature = "clarity-wasm")]
+            return_type: None,
         }
+    }
+
+    #[cfg(feature = "clarity-wasm")]
+    pub fn with_return_type(mut self, return_type: Option<TypeSignature>) -> Self {
+        self.return_type = return_type;
+        self
     }
 
     /// Clarity source-level function name.
@@ -462,6 +474,11 @@ impl DefinedFunction {
         &self.arg_types
     }
 
+    #[cfg(feature = "clarity-wasm")]
+    pub fn get_return_type(&self) -> &Option<TypeSignature> {
+        &self.return_type
+    }
+
     pub fn canonicalize_types(&mut self, epoch: &StacksEpochId) {
         for i in 0..self.arguments.len() {
             self.arg_types[i] = self.arg_types[i].canonicalize(epoch);
@@ -500,7 +517,7 @@ impl CallableType {
 // recursing into compound types. This function does not check for legality of
 // these casts, as that is done in the type-checker. Note: depth of recursion
 // should be capped by earlier checks on the types/values.
-fn clarity2_implicit_cast(
+pub(crate) fn clarity2_implicit_cast(
     type_sig: &TypeSignature,
     value: &Value,
 ) -> Result<Value, VmExecutionError> {

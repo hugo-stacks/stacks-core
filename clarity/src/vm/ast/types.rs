@@ -40,6 +40,9 @@ pub struct ContractAST {
     pub top_level_expression_sorting: Option<Vec<usize>>,
     pub referenced_traits: HashMap<ClarityName, TraitDefinition>,
     pub implemented_traits: HashSet<TraitIdentifier>,
+    #[cfg(feature = "clarity-wasm")]
+    #[serde(default)]
+    pub wasm_module: Option<Vec<u8>>,
 }
 
 impl ContractAST {
@@ -54,6 +57,8 @@ impl ContractAST {
             top_level_expression_sorting: Some(Vec::new()),
             referenced_traits: HashMap::new(),
             implemented_traits: HashSet::new(),
+            #[cfg(feature = "clarity-wasm")]
+            wasm_module: None,
         }
     }
 

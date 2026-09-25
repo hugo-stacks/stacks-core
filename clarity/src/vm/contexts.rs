@@ -22,7 +22,11 @@ use serde::Serialize;
 use stacks_common::bounded_format;
 use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::StacksBlockId;
+#[cfg(feature = "clarity-wasm")]
+use wasmi::Engine;
 
+#[cfg(feature = "clarity-wasm")]
+use super::clarity_wasm::{CostMeter, call_function};
 use super::hooks::{
     CallArguments, CallHook, CallTraceFrame, EvalHook, EvalHookNotifier, ExecutionOutcome,
 };
@@ -218,6 +222,10 @@ pub struct GlobalContext<'a, 'hooks> {
     /// A resource limiter that will be polled on every `eval` to check that execution
     /// time and heap allocation don't exceed configured maximums
     pub execution_resource_limiter: ResourceLimiter,
+    #[cfg(feature = "clarity-wasm")]
+    pub engine: Engine,
+    #[cfg(feature = "clarity-wasm")]
+    pub cost_meter: CostMeter,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -247,6 +255,9 @@ pub struct ContractContext {
     pub data_size: u64,
     /// The clarity version of this contract
     clarity_version: ClarityVersion,
+    #[cfg(feature = "clarity-wasm")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wasm_module: Option<Vec<u8>>,
     /// True while the contract is being deployed (inside `initialize_from_ast`).
     /// Constants may only be used as `contract-call?` dispatch targets
     /// after deployment, when their values are frozen.
@@ -262,6 +273,7 @@ pub struct LocalContext<'a> {
     depth: u64,
 }
 
+#[cfg_attr(feature = "clarity-wasm", derive(Clone))]
 pub struct CallStack {
     stack: Vec<FunctionIdentifier>,
     set: HashSet<FunctionIdentifier>,
@@ -891,6 +903,88 @@ impl<'a, 'b, 'hooks> ExecutionState<'a, 'b, 'hooks> {
         })
     }
 
+    #[cfg(feature = "clarity-wasm")]
+    pub fn execute_contract_from_wasm(
+        &mut self,
+        invoke_ctx: &InvocationContext,
+        contract_identifier: &QualifiedContractIdentifier,
+        tx_name: &str,
+        args: &[Value],
+    ) -> Result<Value, VmExecutionError> {
+        let contract_size = self
+            .global_context
+            .database
+            .get_contract_size(contract_identifier)?;
+
+        let cost = self
+            .global_context
+            .cost_track
+            .compute_cost(ClarityCostFunction::LoadContract, &[contract_size])?;
+        self.global_context
+            .cost_meter
+            .charge(&CostMeter::from(cost))?;
+
+        self.global_context.add_memory(contract_size)?;
+
+        finally_drop_memory!(self.global_context, contract_size; {
+            let contract = self.global_context.database.get_contract(contract_identifier)?;
+
+            let func = contract.lookup_function(tx_name)
+                .ok_or_else(|| { VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::UndefinedFunction(tx_name.to_string()) )})?;
+            if !func.is_public() {
+                return Err(VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::NoSuchPublicFunction(contract_identifier.to_string(), tx_name.to_string())));
+            }
+
+            // sanitize contract-call inputs in epochs >= 2.4, exactly as
+            // `inner_execute_contract` does on the interpreter path
+            let args: Result<Vec<Value>, VmExecutionError> = args.iter()
+                .map(|value| {
+                    let expected_type = TypeSignature::type_of(value)?;
+                    let (sanitized_value, _) = Value::sanitize_value(
+                        self.epoch(),
+                        &expected_type,
+                        value.clone(),
+                    ).ok_or_else(|| RuntimeCheckErrorKind::TypeValueError(
+                            Box::new(expected_type),
+                            value.to_error_string(),
+                        )
+                    )?;
+
+                    Ok(sanitized_value)
+                })
+                .collect();
+
+            let args = args?;
+
+            let func_identifier = func.get_identifier();
+            if self.call_stack.contains(&func_identifier) {
+                return Err(VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::CircularReference(vec![func_identifier.to_string()])))
+            }
+            self.call_stack.insert(&func_identifier, true);
+
+            let res = self.execute_function_as_transaction(invoke_ctx,&func, &args, FunctionExecutionOptions::default().with_next_contract(&*contract));
+            self.call_stack.remove(&func_identifier, true)?;
+
+            match res {
+                Ok(value) => {
+                    if let Some(handler) = self.global_context.database.get_cc_special_cases_handler() {
+                        handler(
+                            self.global_context,
+                            invoke_ctx.sender.as_ref(),
+                            invoke_ctx.sponsor.as_ref(),
+                            contract_identifier,
+                            tx_name,
+                            &args,
+                            &value
+                        )?;
+                    }
+                    Ok(value)
+                },
+                Err(e) => Err(e)
+            }
+        })
+    }
+
     /// Runs `function` against a transaction boundary: begin (read-only or
     /// writable), execute, then roll back or handle the result.
     ///
@@ -916,9 +1010,28 @@ impl<'a, 'b, 'hooks> ExecutionState<'a, 'b, 'hooks> {
             .next_contract_context
             .unwrap_or(invoke_ctx.contract_context);
 
-        let callee_view = invoke_ctx.with_contract_context(next_contract_context);
+        #[cfg(feature = "clarity-wasm")]
+        let result = if next_contract_context.wasm_module.is_some() {
+            call_function(
+                function.name(),
+                args,
+                self.global_context,
+                next_contract_context,
+                self.call_stack,
+                invoke_ctx.sender.clone(),
+                invoke_ctx.caller.clone(),
+                invoke_ctx.sponsor.clone(),
+            )
+        } else {
+            let callee_view = invoke_ctx.with_contract_context(next_contract_context);
+            function.execute_apply(args, self, &callee_view)
+        };
 
-        let result = function.execute_apply(args, self, &callee_view);
+        #[cfg(not(feature = "clarity-wasm"))]
+        let result = {
+            let callee_view = invoke_ctx.with_contract_context(next_contract_context);
+            function.execute_apply(args, self, &callee_view)
+        };
 
         if make_read_only {
             self.global_context.roll_back()?;
@@ -1396,11 +1509,20 @@ impl<'a, 'hooks> GlobalContext<'a, 'hooks> {
             chain_id,
             eval_hooks: None,
             execution_resource_limiter: ResourceLimiter::unlimited(),
+            #[cfg(feature = "clarity-wasm")]
+            engine: Engine::default(),
+            #[cfg(feature = "clarity-wasm")]
+            cost_meter: CostMeter::MIN,
         }
     }
 
     pub fn is_top_level(&self) -> bool {
         self.asset_maps.is_empty()
+    }
+
+    #[cfg(feature = "clarity-wasm")]
+    pub fn nesting_depth(&self) -> usize {
+        self.asset_maps.len()
     }
 
     pub fn set_execution_resource_limiter(&mut self, resource_limiter: ResourceLimiter) {
@@ -1705,7 +1827,25 @@ impl ContractContext {
             meta_ft: HashMap::new(),
             clarity_version,
             is_deploying: false,
+            #[cfg(feature = "clarity-wasm")]
+            wasm_module: None,
         }
+    }
+
+    #[cfg(feature = "clarity-wasm")]
+    pub fn set_wasm_module(&mut self, wasm_module: Vec<u8>) {
+        self.wasm_module = Some(wasm_module);
+    }
+
+    #[cfg(feature = "clarity-wasm")]
+    pub fn with_wasm_module<T>(
+        &self,
+        f: impl Fn(&[u8]) -> Result<T, VmExecutionError>,
+    ) -> Result<T, VmExecutionError> {
+        let wasm_module = self.wasm_module.as_ref().ok_or(VmExecutionError::Wasm(
+            crate::vm::errors::WasmError::ModuleNotFound,
+        ))?;
+        f(wasm_module)
     }
 
     /// Lookup a contract constant by name

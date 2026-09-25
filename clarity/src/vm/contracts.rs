@@ -17,7 +17,11 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
+#[cfg(feature = "clarity-wasm")]
+use crate::vm::analysis::ContractAnalysis;
 use crate::vm::ast::ContractAST;
+#[cfg(feature = "clarity-wasm")]
+use crate::vm::clarity_wasm::initialize_contract;
 use crate::vm::contexts::{ContractContext, GlobalContext};
 use crate::vm::errors::VmExecutionError;
 use crate::vm::eval_all;
@@ -58,6 +62,46 @@ impl Contract {
             global_context,
             sponsor,
         )?;
+
+        contract_context.is_deploying = false;
+        Ok(Contract {
+            contract_context: Arc::new(contract_context),
+        })
+    }
+
+    /// Like [`Self::initialize_from_ast`], but runs the contract's compiled Wasm
+    /// module when `contract.wasm_module` is set. The analysis is needed for the
+    /// Wasm runtime's type information.
+    #[cfg(feature = "clarity-wasm")]
+    pub fn initialize_from_ast_with_analysis(
+        contract_identifier: QualifiedContractIdentifier,
+        contract: &mut ContractAST,
+        contract_analysis: &ContractAnalysis,
+        sponsor: Option<PrincipalData>,
+        global_context: &mut GlobalContext,
+        version: ClarityVersion,
+    ) -> Result<Contract, VmExecutionError> {
+        let mut contract_context = ContractContext::new(contract_identifier, version);
+        contract_context.is_deploying = true;
+
+        if let Some(wasm_module) = contract.wasm_module.take() {
+            contract_context.set_wasm_module(wasm_module);
+            global_context.execute(|global_context| {
+                initialize_contract(
+                    global_context,
+                    &mut contract_context,
+                    sponsor,
+                    contract_analysis,
+                )
+            })?;
+        } else {
+            eval_all(
+                &contract.expressions,
+                &mut contract_context,
+                global_context,
+                sponsor,
+            )?;
+        }
 
         contract_context.is_deploying = false;
         Ok(Contract {

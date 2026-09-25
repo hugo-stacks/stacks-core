@@ -13,6 +13,8 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#[cfg(feature = "clarity-wasm")]
+use std::string::FromUtf8Error;
 use std::{error, fmt};
 
 use clarity_types::Value;
@@ -69,6 +71,8 @@ pub enum VmExecutionError {
     /// The `EarlyReturnError` wraps the specific early return condition, detailing the premature
     /// termination cause.
     EarlyReturn(EarlyReturnError),
+    #[cfg(feature = "clarity-wasm")]
+    Wasm(WasmError),
 }
 
 /// Represents an internal, unrecoverable error within the Clarity VM.
@@ -114,6 +118,9 @@ pub enum VmInternalError {
     /// a panic.
     /// The `String` provides a message describing the failed expectation.
     Expect(String),
+
+    #[cfg(feature = "clarity-wasm")]
+    InterpreterError(String),
 }
 
 /// Runtime errors that Clarity smart contracts are expected to trigger during execution in the virtual
@@ -168,6 +175,8 @@ pub enum RuntimeError {
     BlockTimeNotAvailable,
     /// A Clarity string used as a token name for a post-condition is not a valid Clarity name.
     BadTokenName(String),
+    #[cfg(feature = "clarity-wasm")]
+    BadTypeConstruction,
 }
 
 #[derive(Debug, PartialEq)]
@@ -182,6 +191,119 @@ pub enum EarlyReturnError {
     /// The `Box<Value>` holds the value provided as the second argument to `asserts!`.
     AssertionFailed(Box<Value>),
 }
+
+/// WasmErrors are errors that *should never* occur.
+/// Test executions may trigger these errors, but if they show up in normal
+/// execution, it indicates a bug in the Wasm compiler or runtime.
+#[cfg(feature = "clarity-wasm")]
+#[derive(Debug)]
+pub enum WasmError {
+    WasmGeneratorError(String),
+    ModuleNotFound,
+    DefinesNotFound,
+    TopLevelNotFound,
+    MemoryNotFound,
+    GlobalNotFound(String),
+    NotInDatabase(String),
+    WasmCompileFailed(wasmi::Error),
+    UnableToLoadModule(wasmi::Error),
+    UnableToLinkHostFunction(String, wasmi::Error),
+    UnableToReadIdentifier(FromUtf8Error),
+    UnableToRetrieveIdentifier(i32),
+    InvalidClarityName(String),
+    UnableToWriteStackPointer(wasmi::Error),
+    UnableToReadMemory(wasmi::Error),
+    UnableToWriteMemory(wasmi::Error),
+    ValueTypeMismatch,
+    InvalidNoTypeInValue,
+    InvalidListUnionTypeInValue,
+    InvalidFunctionKind(String),
+    DefineFunctionCalledInRunMode,
+    ExpectedReturnValue,
+    InvalidIndicator(i32),
+    Runtime(wasmi::Error),
+    /// Type description is invalid or malformed, preventing proper type-checking.
+    InvalidTypeDescription,
+    AllowanceViolation(u128),
+    AllowanceIndexOverflow,
+    Expect(String),
+}
+
+#[cfg(feature = "clarity-wasm")]
+impl fmt::Display for WasmError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            WasmError::WasmGeneratorError(e) => write!(f, "Wasm generator error: {e}"),
+            WasmError::ModuleNotFound => write!(f, "Module not found"),
+            WasmError::DefinesNotFound => write!(f, "Defines function not found"),
+            WasmError::TopLevelNotFound => write!(f, "Top level function not found"),
+            WasmError::MemoryNotFound => write!(f, "Memory not found"),
+            WasmError::GlobalNotFound(e) => write!(f, "Global variable not found: {e}"),
+            WasmError::NotInDatabase(s) => write!(f, "Could not find resource in database for {s}"),
+            WasmError::WasmCompileFailed(e) => write!(f, "Wasm compile failed: {e}"),
+            WasmError::UnableToLoadModule(e) => write!(f, "Unable to load module: {e}"),
+            WasmError::UnableToLinkHostFunction(name, e) => {
+                write!(f, "Unable to link host function {name}: {e}")
+            }
+            WasmError::UnableToReadIdentifier(e) => write!(f, "Unable to read identifier: {e}"),
+            WasmError::UnableToRetrieveIdentifier(id) => {
+                write!(f, "Unable to retrieve identifier: {id}")
+            }
+            WasmError::InvalidClarityName(name) => write!(f, "Invalid Clarity name: {name}"),
+            WasmError::UnableToWriteStackPointer(e) => {
+                write!(f, "Unable to write stack pointer: {e}")
+            }
+            WasmError::UnableToReadMemory(e) => write!(f, "Unable to read memory: {e}"),
+            WasmError::UnableToWriteMemory(e) => write!(f, "Unable to write memory: {e}"),
+            WasmError::ValueTypeMismatch => write!(f, "Value type mismatch"),
+            WasmError::InvalidNoTypeInValue => write!(f, "Invalid no type in value"),
+            WasmError::InvalidListUnionTypeInValue => write!(f, "Invalid list union type in value"),
+            WasmError::InvalidFunctionKind(kind) => write!(f, "Invalid function kind: {kind}"),
+            WasmError::DefineFunctionCalledInRunMode => {
+                write!(f, "Define function called in run mode")
+            }
+            WasmError::ExpectedReturnValue => write!(f, "Expected return value"),
+            WasmError::InvalidIndicator(indicator) => {
+                write!(f, "Invalid response/optional indicator: {indicator}")
+            }
+            WasmError::Runtime(e) => write!(f, "Runtime error: {e}"),
+            WasmError::InvalidTypeDescription => write!(f, "Invalid type description"),
+            WasmError::AllowanceIndexOverflow => write!(f, "Index couldn't fit into u128"),
+            WasmError::AllowanceViolation(idx) => write!(f, "Index {idx} couldn't fit into u128"),
+            WasmError::Expect(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+#[cfg(feature = "clarity-wasm")]
+impl std::error::Error for WasmError {}
+
+// Wasmi has no blanket conversion from arbitrary errors (unlike wasmtime's
+// `anyhow`-based error), so the errors raised by host functions are
+// registered as host errors and converted explicitly.
+#[cfg(feature = "clarity-wasm")]
+macro_rules! impl_wasmi_host_error {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl wasmi::errors::HostError for $ty {}
+
+            impl From<$ty> for wasmi::Error {
+                fn from(err: $ty) -> Self {
+                    wasmi::Error::host(err)
+                }
+            }
+        )*
+    };
+}
+
+#[cfg(feature = "clarity-wasm")]
+impl_wasmi_host_error!(
+    WasmError,
+    VmExecutionError,
+    RuntimeError,
+    crate::vm::costs::CostErrors,
+    crate::vm::analysis::errors::RuntimeCheckErrorKind,
+);
 
 impl PartialEq<VmExecutionError> for VmExecutionError {
     fn eq(&self, other: &VmExecutionError) -> bool {
@@ -264,6 +386,8 @@ impl VmExecutionError {
             }
             VmExecutionError::Internal(_) => true,
             VmExecutionError::Runtime(..) | VmExecutionError::EarlyReturn(_) => false,
+            #[cfg(feature = "clarity-wasm")]
+            VmExecutionError::Wasm(_wasm_error) => true,
         }
     }
 }

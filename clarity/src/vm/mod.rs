@@ -50,6 +50,8 @@ pub mod tests;
 pub mod test_util;
 
 pub mod clarity;
+#[cfg(feature = "clarity-wasm")]
+pub mod clarity_wasm;
 
 use std::collections::BTreeMap;
 

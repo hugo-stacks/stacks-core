@@ -28,6 +28,7 @@ stacks_common = { package = "stacks-common", path = "../stacks-common", default-
 rstest = { version = "0.17.0", optional = true }
 rstest_reuse = { version = "0.5.0", optional = true }
 rusqlite = { workspace = true, optional = true }
+wasmi = { version = "2.0.0", features = ["simd"], optional = true }
 
 [dev-dependencies]
 assert-json-diff = "1.0.0"
@@ -71,6 +72,7 @@ devtools = []
 rollback_value_check = []
 disable-costs = []
 wasm-web = ["stacks_common/wasm-web", "clarity-types/wasm-web"]
+clarity-wasm = ["wasmi", "clarity-types/clarity-wasm"]
 
 [package.metadata.pinny]
 allowed = ["t_prop"]

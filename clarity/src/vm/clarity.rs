@@ -27,6 +27,8 @@ use crate::vm::ast::errors::{ParseError, ParseErrorKind};
 use crate::vm::contexts::{AssetMap, ExecutionState, InvocationContext, OwnedEnvironment};
 use crate::vm::costs::{ExecutionCost, LimitedCostTracker};
 use crate::vm::database::ClarityDatabase;
+#[cfg(feature = "clarity-wasm")]
+use crate::vm::errors::WasmError;
 use crate::vm::errors::{ClarityEvalError, VmExecutionError};
 use crate::vm::events::StacksTransactionEvent;
 use crate::vm::resource_limiter::ResourceBudget;
@@ -69,6 +71,8 @@ pub enum ClarityError {
     /// Contract analysis exceeded the maximum analysis time or heap usage allowed.
     /// Distinct from `ExecutionResourceBudgetExceeded` so an analysis-phase issue is separable end-to-end.
     AnalysisResourceBudgetExceeded(String),
+    #[cfg(feature = "clarity-wasm")]
+    Wasm(WasmError),
 }
 
 impl fmt::Display for ClarityError {
@@ -90,6 +94,8 @@ impl fmt::Display for ClarityError {
             ClarityError::AnalysisResourceBudgetExceeded(s) => {
                 write!(f, "Analysis resource budget exceeded: {s}")
             }
+            #[cfg(feature = "clarity-wasm")]
+            ClarityError::Wasm(e) => fmt::Display::fmt(e, f),
         }
     }
 }
@@ -105,6 +111,8 @@ impl std::error::Error for ClarityError {
             ClarityError::BadTransaction(ref _s) => None,
             ClarityError::ExecutionResourceBudgetExceeded(_) => None,
             ClarityError::AnalysisResourceBudgetExceeded(_) => None,
+            #[cfg(feature = "clarity-wasm")]
+            ClarityError::Wasm(ref e) => Some(e),
         }
     }
 }
